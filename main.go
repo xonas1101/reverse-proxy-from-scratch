@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -52,12 +54,13 @@ func handleConnection(cServer net.Conn, c net.Conn) {
 			break
 		}
 	}
+
+	forwardResponse(cServer, c)
 }
 
 func handleServer(line string, c net.Conn) {
 	writer := bufio.NewWriter(c)
 	stdout := bufio.NewWriter(os.Stdout)
-
 	parts := strings.Split(line, ":")
 
 	switch parts[0] {
@@ -66,9 +69,45 @@ func handleServer(line string, c net.Conn) {
 	case "Connection":
 		line = ""
 	}
-
 	writer.WriteString(line)
 	writer.Flush()
 	stdout.WriteString(line)
 	stdout.Flush()
+}
+
+func forwardResponse(cServer net.Conn, c net.Conn) {
+	reader := bufio.NewReader(cServer)
+	writer := bufio.NewWriter(c)
+	contentLength := 0
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		writer.WriteString(line)
+		writer.Flush()
+
+		trimmed := strings.TrimRight(line, "\r\n")
+		parts := strings.SplitN(trimmed, ":", 2)
+		if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "Content-Length") {
+			n, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if err == nil {
+				contentLength = n
+			}
+		}
+
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	if contentLength > 0 {
+		body := make([]byte, contentLength)
+		if _, err := io.ReadFull(reader, body); err != nil {
+			return
+		}
+		writer.Write(body)
+		writer.Flush()
+	}
 }
