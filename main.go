@@ -83,24 +83,63 @@ func main() {
 	}
 }
 
+func connectBackends() (*bufio.Writer, *bufio.Writer, *bufio.Writer, net.Conn, net.Conn, net.Conn) {
+	backend1, err := net.Dial("tcp", "localhost:9090")
+	if err != nil {
+		log.Printf("failed to dial backend1: %v", err)
+		return nil, nil, nil, nil, nil, nil
+	}
+	writer1 := bufio.NewWriter(backend1)
+	backend2, err := net.Dial("tcp", "localhost:9091")
+	if err != nil {
+		log.Printf("failed to dial backend2: %v", err)
+		return writer1, nil, nil, backend1, nil, nil
+	}
+	writer2 := bufio.NewWriter(backend2)
+	backend3, err := net.Dial("tcp", "localhost:9092")
+	if err != nil {
+		log.Printf("failed to dial backend3: %v", err)
+		return writer1, writer2, nil, backend1, backend2, nil
+	}
+	writer3 := bufio.NewWriter(backend3)
+
+	return writer1, writer2, writer3, backend1, backend2, backend3
+}
+
 func handleConnection(c net.Conn) {
 	defer c.Close()
-
-	backend, err := net.Dial("tcp", "localhost:9090")
-	if err != nil {
-		log.Printf("failed to dial backend: %v", err)
-		return
+	w1, w2, w3, b1, b2, b3 := connectBackends()
+	if b1 != nil {
+		defer b1.Close()
 	}
-	defer backend.Close()
-
+	if b2 != nil {
+		defer b2.Close()
+	}
+	if b3 != nil {
+		defer b3.Close()
+	}
 	reader := bufio.NewReader(c)
 	stdout := bufio.NewWriter(os.Stdout)
-	writer := bufio.NewWriter(backend)
 	host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
 
 	shouldClose := false
-
-	for {
+	var backend net.Conn
+	writer := w1
+	for i := 1; i > 0; i++ {
+		switch i % 3 {
+		case 1:
+			log.Println("Server 1 selected")
+			writer = w1
+			backend = b1
+		case 2:
+			log.Println("Server 1 selected")
+			writer = w2
+			backend = b2
+		case 3:
+			log.Println("Server 1 selected")
+			writer = w3
+			backend = b3
+		}
 		for lineNumber := 1; ; lineNumber++ {
 			if lineNumber == 2 {
 				fmt.Fprintf(writer, "X-Forwarded-For: %s\r\n", host)
