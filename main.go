@@ -1,113 +1,138 @@
-// [x]Phase 1 — Single request/response, no persistence
-
-//     listen on :8080, dial backend fresh per connection (or reuse, your call)
-//     parse request line + headers
-//     strip Connection header
-//     inject X-Forwarded-For with client IP
-//     forward request to backend
-//     read response headers, parse Content-Length, read exact body bytes
-//     write response back to client
-//     close both connections after one exchange
-//     test with curl against /hello, /health, /echo
-
-// [x]Phase 2 — Connection reuse / keep-alive
-
-//     support Connection: keep-alive from client — don't close after one request
-//     loop: read request → forward → respond → read next request on same conn
-//     handle Connection: close to end the loop
-//     separate connection per client (currently you share one cServer dial across all goroutines — fix this: each client needs its own backend dial, not one shared connServer)
-//     add idle timeout so dead connections don't hang forever
-
-// []Phase 3 — Multiple backends / load balancing
-
-//     config: list of upstream addresses instead of one hardcoded localhost:9090
-//     round-robin or random selection per request
-//     basic health check (skip a backend if dial fails)
-//     path-based routing if needed (e.g. /api/* → backend A, /static/* → backend B)
-
-// []Phase 4 — Chunked transfer encoding
-
-//     detect Transfer-Encoding: chunked in response (instead of Content-Length)
-//     parse chunk size line, read chunk, repeat until 0\r\n\r\n terminator
-//     forward chunks to client as they arrive (streaming, don't buffer whole body)
-//     needed for your /stream route to actually work through the proxy
-
-// []Phase 5 — TLS termination
-
-//     listen with tls.Listen on :443 using a cert/key
-//     decrypt incoming HTTPS, forward as plain HTTP to backend (or re-encrypt if backend needs TLS)
-//     redirect HTTP :80 → HTTPS :443 optionally
-//     add X-Forwarded-Proto: https header
-
-// []Phase 6 — WebSocket / Upgrade passthrough
-
-//     detect Upgrade: websocket header
-//     after initial handshake response, switch to raw bidirectional byte copying (no more HTTP parsing)
-//     both directions need concurrent io.Copy (goroutine each way) since it's now full-duplex
-
-// []Phase 7 — Observability & hardening
-
-//     structured logging (method, path, status, latency, backend used)
-//     timeouts on read/write/dial so a slow backend can't hang the proxy
-//     graceful shutdown (SIGINT/SIGTERM → stop accepting, drain in-flight requests)
-//     basic metrics (request count, error count, per-backend latency)
-//     config file instead of hardcoded addresses
+// Phase 1 — Single request/response
+// Phase 2 — Keep-alive / idle timeout
+// Phase 3 — Round robin across backends (per-connection cycling)
+// Phase 4 — Chunked transfer encoding
+// Phase 5 — TLS termination
+// Phase 6 — WebSocket / Upgrade passthrough
+// Phase 7 — Logging, graceful shutdown, dial timeouts
 
 package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
+var backendAddrs = []string{
+	"localhost:9090",
+	"localhost:9091",
+	"localhost:9092",
+}
+
+var (
+	activeConns  sync.WaitGroup
+	shuttingDown = false
+	shutdownMu   sync.Mutex
+)
+
+func isShuttingDown() bool {
+	shutdownMu.Lock()
+	defer shutdownMu.Unlock()
+	return shuttingDown
+}
+
 func main() {
-	listener, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		log.Fatalf("Internal Server Error: %v\n", err)
+	useTLS := len(os.Args) > 1 && os.Args[1] == "-tls"
+
+	var listener net.Listener
+	var err error
+
+	if useTLS {
+		cert, cerr := tls.LoadX509KeyPair("cert.pem", "key.pem")
+		if cerr != nil {
+			log.Fatalf("failed to load TLS cert/key: %v", cerr)
+		}
+		tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+		listener, err = tls.Listen("tcp", ":8443", tlsCfg)
+		if err != nil {
+			log.Fatalf("failed to listen (tls): %v\n", err)
+		}
+		log.Println("proxy listening on :8443 (TLS)")
+	} else {
+		listener, err = net.Listen("tcp", ":8080")
+		if err != nil {
+			log.Fatalf("failed to listen: %v\n", err)
+		}
+		log.Println("proxy listening on :8080")
 	}
+
+	// graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		log.Println("shutdown signal received, closing listener...")
+		shutdownMu.Lock()
+		shuttingDown = true
+		shutdownMu.Unlock()
+		listener.Close()
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Error connecting to server: %v\n", err)
+			if isShuttingDown() {
+				break
+			}
+			log.Printf("accept error: %v\n", err)
 			continue
 		}
-		go handleConnection(conn)
+		activeConns.Add(1)
+		go func() {
+			defer activeConns.Done()
+			handleConnection(conn, useTLS)
+		}()
 	}
+
+	log.Println("draining in-flight connections...")
+	activeConns.Wait()
+	log.Println("shutdown complete")
 }
 
 func connectBackends() (*bufio.Writer, *bufio.Writer, *bufio.Writer, net.Conn, net.Conn, net.Conn) {
-	backend1, err := net.Dial("tcp", "localhost:9090")
-	if err != nil {
-		log.Printf("failed to dial backend1: %v", err)
-		return nil, nil, nil, nil, nil, nil
+	dial := func(addr string) net.Conn {
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			log.Printf("failed to dial %s: %v", addr, err)
+			return nil
+		}
+		return conn
 	}
-	writer1 := bufio.NewWriter(backend1)
-	backend2, err := net.Dial("tcp", "localhost:9091")
-	if err != nil {
-		log.Printf("failed to dial backend2: %v", err)
-		return writer1, nil, nil, backend1, nil, nil
-	}
-	writer2 := bufio.NewWriter(backend2)
-	backend3, err := net.Dial("tcp", "localhost:9092")
-	if err != nil {
-		log.Printf("failed to dial backend3: %v", err)
-		return writer1, writer2, nil, backend1, backend2, nil
-	}
-	writer3 := bufio.NewWriter(backend3)
 
-	return writer1, writer2, writer3, backend1, backend2, backend3
+	b1 := dial(backendAddrs[0])
+	b2 := dial(backendAddrs[1])
+	b3 := dial(backendAddrs[2])
+
+	var w1, w2, w3 *bufio.Writer
+	if b1 != nil {
+		w1 = bufio.NewWriter(b1)
+	}
+	if b2 != nil {
+		w2 = bufio.NewWriter(b2)
+	}
+	if b3 != nil {
+		w3 = bufio.NewWriter(b3)
+	}
+	return w1, w2, w3, b1, b2, b3
 }
 
-func handleConnection(c net.Conn) {
+func handleConnection(c net.Conn, useTLS bool) {
+	start := time.Now()
 	defer c.Close()
+
 	w1, w2, w3, b1, b2, b3 := connectBackends()
 	if b1 != nil {
 		defer b1.Close()
@@ -118,47 +143,75 @@ func handleConnection(c net.Conn) {
 	if b3 != nil {
 		defer b3.Close()
 	}
+
 	reader := bufio.NewReader(c)
 	stdout := bufio.NewWriter(os.Stdout)
 	host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
-
 	shouldClose := false
-	var backend net.Conn
-	writer := w1
-	for i := 1; i > 0; i++ {
+	isUpgrade := false
+
+	for i := 1; ; i++ {
+		var writer *bufio.Writer
+		var backend net.Conn
+		var backendAddr string
+
 		switch i % 3 {
 		case 1:
-			log.Println("Server 1 selected")
-			writer = w1
-			backend = b1
+			writer, backend, backendAddr = w1, b1, backendAddrs[0]
 		case 2:
-			log.Println("Server 1 selected")
-			writer = w2
-			backend = b2
-		case 3:
-			log.Println("Server 1 selected")
-			writer = w3
-			backend = b3
+			writer, backend, backendAddr = w2, b2, backendAddrs[1]
+		case 0:
+			writer, backend, backendAddr = w3, b3, backendAddrs[2]
 		}
+
+		if backend == nil {
+			log.Printf("selected backend unavailable, stopping conn from %s", host)
+			return
+		}
+
+		var method, path string
+
 		for lineNumber := 1; ; lineNumber++ {
 			if lineNumber == 2 {
 				fmt.Fprintf(writer, "X-Forwarded-For: %s\r\n", host)
+				if useTLS {
+					fmt.Fprintf(writer, "X-Forwarded-Proto: https\r\n")
+				}
 				writer.Flush()
 			}
 			c.SetReadDeadline(time.Now().Add(10 * time.Second))
 			line, err := reader.ReadString('\n')
 			if err != nil {
-				return // client gone, stop handling this connection
+				return
 			}
 			stdout.WriteString(line)
 			stdout.Flush()
-			handleServer(line, backend, &shouldClose)
+
+			if lineNumber == 1 {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					method, path = parts[0], parts[1]
+				}
+			}
+
+			upgraded := handleServer(line, backend, &shouldClose)
+			if upgraded {
+				isUpgrade = true
+			}
 
 			if line == "\r\n" || line == "\n" {
 				break
 			}
 		}
-		forwardResponse(backend, c)
+
+		if isUpgrade {
+			log.Printf("[%s] %s %s → %s (upgrade, switching to raw passthrough)", host, method, path, backendAddr)
+			pipeRaw(c, backend)
+			return
+		}
+
+		status := forwardResponse(backend, c)
+		log.Printf("[%s] %s %s → %s [%d] %v", host, method, path, backendAddr, status, time.Since(start))
 
 		if shouldClose {
 			return
@@ -166,32 +219,65 @@ func handleConnection(c net.Conn) {
 	}
 }
 
-func handleServer(line string, c net.Conn, shouldClose *bool) {
+// pipeRaw does bidirectional raw byte copying, used after a websocket
+// upgrade handshake — no more HTTP parsing from this point on.
+func pipeRaw(client net.Conn, backend net.Conn) {
+	client.SetReadDeadline(time.Time{}) // clear timeout, connection is now long-lived
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(backend, client)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(client, backend)
+	}()
+	wg.Wait()
+}
+
+// handleServer mutates a single header line before forwarding it to the
+// backend. Returns true if this line signals a websocket upgrade.
+func handleServer(line string, c net.Conn, shouldClose *bool) bool {
 	writer := bufio.NewWriter(c)
 	stdout := bufio.NewWriter(os.Stdout)
-	parts := strings.Split(line, ":")
+	parts := strings.SplitN(line, ":", 2)
+	upgrade := false
 
-	switch parts[0] {
+	switch strings.TrimSpace(parts[0]) {
 	case "Host":
 		line = fmt.Sprintf("Host: %s\r\n", c.RemoteAddr().String())
 	case "Connection":
-		if len(parts) > 1 && strings.TrimSpace(parts[1]) == "close" {
+		if len(parts) > 1 && strings.Contains(strings.ToLower(parts[1]), "close") {
 			*shouldClose = true
 		}
-		line = ""
+		if len(parts) > 1 && strings.Contains(strings.ToLower(parts[1]), "upgrade") {
+			line = "Connection: Upgrade\r\n"
+		} else {
+			line = ""
+		}
+	case "Upgrade":
+		if len(parts) > 1 && strings.Contains(strings.ToLower(parts[1]), "websocket") {
+			upgrade = true
+		}
 	}
 	writer.WriteString(line)
 	writer.Flush()
 	stdout.WriteString(line)
 	stdout.Flush()
+	return upgrade
 }
 
-func forwardResponse(cServer net.Conn, c net.Conn) {
+// forwardResponse reads response headers, dispatches to chunked or
+// content-length body handling, and returns the status code for logging.
+func forwardResponse(cServer net.Conn, c net.Conn) int {
 	reader := bufio.NewReader(cServer)
 	writer := bufio.NewWriter(c)
 	contentLength := 0
+	chunked := false
+	status := 0
 
-	for {
+	for lineNumber := 1; ; lineNumber++ {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			break
@@ -199,12 +285,27 @@ func forwardResponse(cServer net.Conn, c net.Conn) {
 		writer.WriteString(line)
 		writer.Flush()
 
+		if lineNumber == 1 {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if n, err := strconv.Atoi(fields[1]); err == nil {
+					status = n
+				}
+			}
+		}
+
 		trimmed := strings.TrimRight(line, "\r\n")
 		parts := strings.SplitN(trimmed, ":", 2)
-		if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "Content-Length") {
-			n, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-			if err == nil {
-				contentLength = n
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			if strings.EqualFold(key, "Content-Length") {
+				if n, err := strconv.Atoi(val); err == nil {
+					contentLength = n
+				}
+			}
+			if strings.EqualFold(key, "Transfer-Encoding") && strings.EqualFold(val, "chunked") {
+				chunked = true
 			}
 		}
 
@@ -213,12 +314,53 @@ func forwardResponse(cServer net.Conn, c net.Conn) {
 		}
 	}
 
+	if chunked {
+		forwardChunks(reader, writer)
+		return status
+	}
+
 	if contentLength > 0 {
 		body := make([]byte, contentLength)
 		if _, err := io.ReadFull(reader, body); err != nil {
-			return
+			return status
 		}
 		writer.Write(body)
+		writer.Flush()
+	}
+	return status
+}
+
+func forwardChunks(reader *bufio.Reader, writer *bufio.Writer) {
+	for {
+		sizeLine, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		writer.WriteString(sizeLine)
+		writer.Flush()
+
+		sizeHex := strings.TrimRight(sizeLine, "\r\n")
+		size, err := strconv.ParseInt(sizeHex, 16, 64)
+		if err != nil {
+			return
+		}
+
+		if size == 0 {
+			trailer, _ := reader.ReadString('\n')
+			writer.WriteString(trailer)
+			writer.Flush()
+			return
+		}
+
+		chunk := make([]byte, size)
+		if _, err := io.ReadFull(reader, chunk); err != nil {
+			return
+		}
+		writer.Write(chunk)
+
+		trailingCRLF := make([]byte, 2)
+		io.ReadFull(reader, trailingCRLF)
+		writer.Write(trailingCRLF)
 		writer.Flush()
 	}
 }
