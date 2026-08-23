@@ -1,3 +1,51 @@
+// **[x]Phase 1 — Single request/response, no persistence**
+// - listen on :8080, dial backend fresh per connection (or reuse, your call)
+// - parse request line + headers
+// - strip `Connection` header
+// - inject `X-Forwarded-For` with client IP
+// - forward request to backend
+// - read response headers, parse `Content-Length`, read exact body bytes
+// - write response back to client
+// - close both connections after one exchange
+// - test with curl against `/hello`, `/health`, `/echo`
+
+// **[]Phase 2 — Connection reuse / keep-alive**
+// - support `Connection: keep-alive` from client — don't close after one request
+// - loop: read request → forward → respond → read next request on same conn
+// - handle `Connection: close` to end the loop
+// - separate connection per client (currently you share one `cServer` dial across all goroutines — fix this: each client needs its own backend dial, not one shared `connServer`)
+// - add idle timeout so dead connections don't hang forever
+
+// **[]Phase 3 — Multiple backends / load balancing**
+// - config: list of upstream addresses instead of one hardcoded `localhost:9090`
+// - round-robin or random selection per request
+// - basic health check (skip a backend if dial fails)
+// - path-based routing if needed (e.g. `/api/*` → backend A, `/static/*` → backend B)
+
+// **[]Phase 4 — Chunked transfer encoding**
+// - detect `Transfer-Encoding: chunked` in response (instead of `Content-Length`)
+// - parse chunk size line, read chunk, repeat until `0\r\n\r\n` terminator
+// - forward chunks to client as they arrive (streaming, don't buffer whole body)
+// - needed for your `/stream` route to actually work through the proxy
+
+// **[]Phase 5 — TLS termination**
+// - listen with `tls.Listen` on :443 using a cert/key
+// - decrypt incoming HTTPS, forward as plain HTTP to backend (or re-encrypt if backend needs TLS)
+// - redirect HTTP :80 → HTTPS :443 optionally
+// - add `X-Forwarded-Proto: https` header
+
+// **[]Phase 6 — WebSocket / Upgrade passthrough**
+// - detect `Upgrade: websocket` header
+// - after initial handshake response, switch to raw bidirectional byte copying (no more HTTP parsing)
+// - both directions need concurrent `io.Copy` (goroutine each way) since it's now full-duplex
+
+// **[]Phase 7 — Observability & hardening**
+// - structured logging (method, path, status, latency, backend used)
+// - timeouts on read/write/dial so a slow backend can't hang the proxy
+// - graceful shutdown (SIGINT/SIGTERM → stop accepting, drain in-flight requests)
+// - basic metrics (request count, error count, per-backend latency)
+// - config file instead of hardcoded addresses
+
 package main
 
 import (
