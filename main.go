@@ -64,6 +64,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -105,6 +106,7 @@ func handleConnection(c net.Conn) {
 				fmt.Fprintf(writer, "X-Forwarded-For: %s\r\n", host)
 				writer.Flush()
 			}
+			c.SetReadDeadline(time.Now().Add(10 * time.Second))
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				return // client gone, stop handling this connection
@@ -117,7 +119,6 @@ func handleConnection(c net.Conn) {
 				break
 			}
 		}
-
 		forwardResponse(backend, c)
 
 		if shouldClose {
